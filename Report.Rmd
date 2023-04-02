@@ -1,0 +1,579 @@
+---
+title: "Choose Your Own Project"
+author: "Teo Fernandes"
+date: "2023-03-19"
+output:
+  pdf_document: default
+  html_document: default
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE, warning = FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## 1. Introduction
+
+The goal of the project is to gain insight on the stock price of US Oil
+companies. Within the project , we try to predict the stock price based on the companies financial statements.
+We can think it as a [Fundamental Analysis](https://www.investopedia.com/terms/f/fundamentalanalysis.asp) using Machine Learning. 
+We will make the assumption that the price can be solely explained by the company financial performances. This is a fairly strong assumption, in contrast, many economists introduced other concepts to explain the market behavior, such as the [Behavioral economics](https://en.wikipedia.org/wiki/Behavioral_economics) by Kahneman. 
+The price can also be evaluated based on intangible assets, competitive advantage or top-management team which cannot be reported in the financial statement.
+
+
+We used the following data sources :
+
+-   Companies financial statements from SEC: <https://www.sec.gov/>
+
+-   Stock price from third party website: <https://www.macrotrends.net>
+
+-   Company list : <https://en.wikipedia.org>
+
+
+### Libraries
+
+```{r lib , echo = TRUE, message = FALSE}
+library(tidyverse)
+library(rvest)
+library(lubridate)
+library(jsonlite)
+library(caret)
+library(matrixStats)
+library(xgboost)
+library(pls)
+library(zoo)
+```
+
+## 2. Creating the dataset
+
+### Scraping the web
+
+#### Preparation  
+
+Before starting to scrap the web, we set the User Agent to avoid the "ERROR 403"
+
+```{r setting, eval = FALSE}
+options(HTTPUserAgent = "yourName   YourName@domain.com",
+        timeout = Inf)
+```
+
+#### SEC Website  
+
+We fetch the companies financial statements from the SEC website. The
+[website documentation](https://www.sec.gov/edgar/sec-api-documentation)
+tells us that *'The most efficient means to fetch large amounts
+of API data is the bulk archive ZIP files'.*
+
+We therefore use the provided link to download the bulk data and store
+it in our working directory as "companyfacts.zip".
+
+```{r download, eval = FALSE}
+DownloadBulkData <- function(){ 
+url <- "https://www.sec.gov/Archives/edgar/daily-index/xbrl/companyfacts.zip"
+download.file(url, "companyfacts.zip", quiet = FALSE  )
+}
+```
+  
+#### Wikipedia  
+
+We fetch the company list from this [Wikipedia
+page](https://en.wikipedia.org/wiki/List_of_S%26P_500_companies) and
+store the raw table in the SPList variable.
+
+```{r fetch_wikipedia, eval = TRUE}
+url <- "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+h <- read_html(url)
+SPlist <- html_nodes(h, "table")[[1]] %>% html_table(convert = FALSE)
+```
+
+```{r glimpse_sp500, echo = FALSE, eval = TRUE}
+glimpse(SPlist)
+```
+  
+Next, we keep the companies that belong to the Oil sector and that reports data for at least 10 years.
+
+```{r prepare_wikipedia, eval = TRUE}
+OilList <- SPlist %>% filter(str_detect( .$`GICS Sub-Industry`, "Oil")) %>%
+  mutate(across(`Date added`, as.Date)) %>% 
+  filter(year(`Date added`) <= year(Sys.Date())-10)
+```
+
+```{r glimpse_oil, echo = FALSE, eval = TRUE }
+glimpse(OilList)
+```
+  
+Finally, we store the data.
+
+```{r storeOil}
+oilCIK <- OilList %>% select(CIK)
+oilTicker <- OilList %>% select(Symbol)
+```
+  
+#### Company stock price  
+
+Firstly, we create url based on company ticker symbol.\
+- **MakePriceUrl()** generates URL based on the company ticker symbol\
+- **PricesURls()** generates a list of url from a list of company ticker
+symbol
+
+```{r createurl}
+MakePriceUrl <- function(ticker){
+  paste0("https://www.macrotrends.net/stocks/charts/",
+         ticker,
+         "/a/stock-price-history")
+}
+
+PricesURls <- function(tick = oilTicker){
+  urls <- sapply(tick, MakePriceUrl)
+  data.frame(ticker = tick, urls = urls)
+}
+```
+  
+We define **FetchPrice()** that extracts price table website based on
+the url
+
+```{r extractprice}
+FetchPrice <- function(url){
+  h <- read_html(url) %>% html_nodes('table')
+  df <- h[[1]] %>% html_table() %>% .[2:nrow(.),1:2]
+  return(data.frame(year = pull(df[,1]), price = pull(df[,2])))
+}
+```
+  
+We use **map2()** to apply **FetchPrice()** over the url and ticker list
+from **PricesURls()**.\
+Then **do.call()** will create a unique dataframe out of the resulting
+list.\
+Finally, we use **left_join()** to add the CIK number that will be used
+later for joining table.
+
+```{r store_price, eval = TRUE}
+OilCompanyPrices <- map2(PricesURls()[[1]], PricesURls()[[2]], 
+     ~ FetchPrice(.y) %>% 
+       mutate(ticker = .x)) %>% 
+  do.call(rbind , .) %>% 
+  mutate(across(c(price,year),as.numeric)) %>%
+  left_join(OilList %>% select(CIK, Symbol), by = c("ticker" = "Symbol")) %>%
+  mutate(CIK = as.numeric(CIK))
+```
+
+```{r store_price_display, echo = FALSE}
+glimpse(OilCompanyPrices)
+```
+
+```{r store_price_plot, echo = FALSE}
+OilCompanyPrices %>% mutate(across(c(price,year),as.numeric)) %>%
+  ggplot(aes(year, price, col = ticker)) +
+  geom_line() +
+  ggtitle("US oil companies price")
+  
+```
+
+  
+### Merging the tables  
+
+We will use the following steps to merge the tables together.  
+`Select label from the financial statement table -> rectangling it -> joining it with the stock price table`
+  
+#### Preparing the financial Statement table
+
+The "companyfacts.zip" that we downloaded earlier contains all financial
+statements that have been reported from all of the US companies. For
+this project, we will only need the financial statement of the oil
+companies.\
+Within the zip file, a company data is stored in a json file, named with
+the following pattern:\
+`CIK + Company number + .json`
+
+We can check all the filenames that are inside the zip file using
+`unzip(. , list = TRUE)`
+
+```{r checkzipfile}
+allFileNames <- unzip( "companyfacts.zip", list = TRUE) %>% .$Name %>% as_tibble()
+```
+
+```{r displayzipfile, echo = FALSE, eval = TRUE}
+glimpse(allFileNames)
+```
+  
+We generate filenames of the oil company and unzip it in the
+'oilCompanies' directory
+
+```{r oilfilename}
+filenames <- sapply(oilCIK, function(cik){
+  paste0("CIK",cik,".json")
+}) %>% as_tibble()
+
+unzip("companyfacts.zip",files = filenames %>% pull, exdir = "oilCompanies")
+```
+  
+We create the path of the file within oilCompanies directory, based on
+the working directory
+
+```{r oilpath}
+thelist <- list.files("oilCompanies/") %>% sapply(function(x) {
+  file.path(getwd(), "oilCompanies", x)})
+```
+  
+We convert the json file to a dataframe with **jsonToDf()**. We use a
+combination of **unnest_longer()** and **unnest_wider()** to collapse
+deeply nested lists into regular columns.
+
+```{r converter}
+jsonToDf <- function(js) {
+  js %>% as_tibble() %>% 
+    unnest_longer("facts") %>%
+    unnest_wider("facts") %>%
+    unnest_longer("units") %>%
+    unnest("units") %>%
+    unnest_wider("units")
+}
+```
+  
+We apply **jsonToDf()** to all the json file within the "oilCompany"
+directory. Please note that it may takes a few minutes.
+
+```{r fullTable, eval = FALSE}
+FullTable <- map(thelist, function(x){
+  read_json(x) %>% jsonToDf()
+}) %>% do.call(rbind, .)
+```
+
+```{r FullTableDisplay_example, echo = FALSE}
+### This piece of code load the Table that has already been downloaded on my 
+### working directory to make the Rmd rendering faster and to avoid regenerating the FullTable everytime
+FullTable <- read.csv("FullTable.csv")
+FullTable %>% glimpse()
+```
+  
+Let's explain the meaning of the variables\
+- **cik** : a unique company identification number [details
+here](https://www.sec.gov/page/edgar-how-do-i-look-central-index-key-cik-number)\
+- **entityName** : the name of the company\
+- **label** : the name of the financial statement [details
+here](https://www.investopedia.com/terms/f/financial-statements.asp)\
+- **description** : the description of the financial statement  
+- **end** : end date of effect the statement\  
+- **val** : the value of the statement\  
+- **accn** : the accession number of the statement, unique
+identifier assigned automatically to an accepted submission [details
+here](https://www.sec.gov/os/accessing-edgar-data)\  
+- **fy** : the fiscal year of the statement\
+- **fp** : the fiscal periods (quarter or year)\
+- **form** : the form of the submission, 10-K, 10-Q or 8-K [details
+here](https://www.sec.gov/forms)\
+- **filed** : date when the submission has been filed\
+- **frame** : indicate the fy and the fp at a glance\
+- **start** : date of entry into effect of statement\
+- **units_id** : units of the statement\
+- **facts_id** same as label but without space and special character
+  
+Next, we make the dataframe wider, making the label into individuals columns.
+To clean the data :\
+- We group by the accession number as it represented one observation\
+*Explanation: company usually reports financial data four times a year,
+each time they report it, it is registered as a unique accession
+number*\
+- We only consider statement that have the same end year as the fiscal
+year. *Explanation: in financial statement such as 10-K, the companies
+reported comparison across the 3 previous year. For example, in the
+fiscal year 2020, we will also have the statement of 2019 and 2018.*\
+- In case of one label still have different value, despite the two
+cleaning operations above, we only keep the statement that have the
+earliest end date.
+
+```{r rectangling}
+Rectangling  <- function(table = FullTable){
+  table %>% 
+  mutate(end = ymd(end)) %>%
+  group_by(accn, label) %>%
+  filter(year(end) == fy) %>% 
+  arrange(desc(end)) %>%
+  slice_head() %>%
+  ungroup() %>%
+  select(c(entityName, label, fy, fp, form, val)) %>%
+  pivot_wider(names_from = label, values_from = val)
+  }
+```
+  
+Before applying **Rectangling()** to the `FullTable` dataframe, let's
+verify the number of different statement.
+
+```{r numberOfLabel, echo = TRUE, eval = TRUE}
+FullTable %>% mutate(across(label, as_factor)) %>% summarise(levels(label) %>% length()) %>% pull
+```
+
+This means that applying Rectangling() to the `FullTable` will generate
+2695 differents column for the label.\
+Another problem that arise will be the NA value across these columns.\
+*Explanation: accounting labels usage differ between companies and
+change can occur across the year within the same companies.*
+
+To illustrate it, we show all the labels that are related with the
+"Revenue".
+
+```{r revenueExample, eval = TRUE}
+FullTable %>% mutate(across(label, as_factor)) %>% summarise(lev = levels(label)) %>% filter(str_detect(lev, "^Revenue"))
+```
+
+We notice that Revenue have 10 different terms. Are they accounting for
+the same statement or is there variation ?\
+We can either group them into higher level label group based on key
+words or we can select the label that have the highest occurrences rate
+in the data frame.\
+Here we will go for the second option.
+
+Again, we only keep the statement that have corresponding end date year
+and fiscal year. We will only keep the statement that comes from the
+10-K since it represents the year statement.
+
+```{r factStats}
+facts_stats <- FullTable %>% group_by(accn) %>%
+  filter(year(end) == fy) %>%
+  ungroup() %>%
+  filter(form == "10-K") %>%
+  group_by(label) %>%
+  summarise(n = n()) %>%
+  arrange(desc(n)) %>% filter(n >= 10)
+```
+
+```{r displayfactStats, echo = FALSE, message = FALSE}
+top_n(facts_stats, 20)
+```
+We note that "Revenues" are among the most recurring label while the
+other variation of Revenues doesn't appear here.
+
+
+  
+#### Joining the financial table with stock price  
+
+We will merge the price table and the financial statement table using the company name and the fiscal year.    
+ 
+We create `pricetable` which contains the stock price, the fiscal year and the company name.  
+```{r priceWithName, warning = FALSE}
+pricetable <- OilCompanyPrices %>% left_join(FullTable, by = c("year" = "fy", "CIK" = "cik")) %>%
+  select(year, price, entityName) %>% unique() %>% drop_na()
+```
+
+```{r displaypriceWithName, echo = FALSE}
+glimpse(pricetable)
+```
+
+`finTable` is a financial table that has been rectangled and filter on the label of interest. 
+
+```{r addPrice}
+AddingStockPrice <- function(finTable){
+finTable %>% left_join(pricetable, by = c( "fy" = "year" , "entityName")) %>%
+  return()
+}
+```
+  
+We write a function that based on the label that we want to study, extract it from the `FullTable`, apply **Rectangling()**  and add the stock price.
+```{r selectLabelPrice}
+
+selectLabelPrice <- function(selectedLabel, drop_na = TRUE){
+  X <- FullTable %>%  filter(form =='10-K' & label %in% selectedLabel) %>% 
+  Rectangling() %>%
+  mutate(across(-c(1,2,3,4),as.numeric)) %>% AddingStockPrice()
+  ifelse(drop_na == TRUE, 
+         return(X %>% drop_na()),
+         return(X))
+}
+```
+Example if we want to study the Revenues and the Assets:
+```{r exampleSelectLabel}
+selectLabelPrice(c("Assets","Revenues")) %>% glimpse()
+```
+
+  
+## 3. Method, Analysis
+
+### Dataset
+We select the 25 most used label to avoid having too much NA value.
+We choose to fill the missing value with the column mean using **na.aggregate()**.
+
+```{r, message = FALSE}
+df <- selectLabelPrice(facts_stats %>% top_n(25) %>% .$label, drop_na = FALSE) %>%
+  .[5:ncol(.)] %>% na.aggregate()
+```
+```{r, echo = FALSE}
+glimpse(df)
+```
+We can compute summaries
+We have 228 observations for 26 variables.
+```{r dim}
+dim(df)
+```
+
+Distribution of the response variable. We notice that most of the prices are under 100 $.
+```{r}
+hist(df$price, nclass = 10, main = "US Oil Companies Stock price")
+```
+
+Correlation between some variables.
+```{r pairs}
+pairs(df %>% select(16:26), main = "Correlation between the predictors")
+```
+  
+We notice that some predictors are highly correlated. We will adress the problem by doing a principal component analysis.  
+```{r predictors correlation}
+as.matrix(cor(df %>% select(-price))) %>% image(main = "Correlation between the predictors")
+```
+
+
+We split the data into a training and test set.
+```{r split, message = FALSE}
+set.seed(2023)
+train_index <- createDataPartition(df$price, p = 0.9, list = FALSE)
+train <- df[train_index,]
+test <- df[-train_index,]
+
+y_train <- df[train_index,] %>% select(price)
+y_test <- df[-train_index,] %>% select(price) %>% pull
+
+``` 
+  
+Our outcome variable is the price, which is continuous. Since this is a regression problem, we will use RMSE metric to compare the accuracy across the models.
+```{r RMSE}
+RMSE <- RMSE <- function(true, predicted){
+  sqrt(mean((true - predicted)^2))
+}
+```
+  
+### Linear Model
+
+For the first approach, we  fit a linear Model since it provides the most understandable results.
+```{r lm_model, warning = FALSE}
+control <- trainControl(method = "cv", number = 25)
+model_lm <- train(price ~ ., method = "lm", data = train, trControl = control)
+summary(model_lm)
+rmse_lm <- RMSE(predict(model_lm, test), y_test)
+```
+We get a very small p-value meaning is overall significant. However, the R squared is pretty low meaning the model isn't very good for predicting.
+
+### Linear Model with PCA
+We generate another linear model but with the principal components
+```{r pca}
+model_pca <- pcr(price ~ . , data = train, validation ="CV")
+```
+
+```{r summary, echo = FALSE, warning = FALSE}
+summary(model_pca)
+```
+
+Since first component explains 93 % of the variance, we will create our model using it
+
+```{r  lm_pca_model}
+rmse_lm_pca <- RMSE(predict(model_pca, test, ncomp = 1), y_test)
+```
+
+  
+### RandomForest
+For the next model, we use random forest that can be used for both regression and classification problem. 
+```{r}
+grid <- data.frame(mtry = c(1, 5, 10, 25))
+
+model_rf <- train(price ~ ., method = "rf", data = train, 
+                  trControl = control, 
+                  tuneGrid = grid,
+                  ntree = 100)
+rmse_rf <- RMSE(predict(model_rf, newdata = test),y_test)
+```
+For the hyperparameter tuning, we can visualize which value of mtry provides the lowest RMSE.  
+```{r hyperparameter_tuning}
+plot(model_rf)  
+```
+
+### Gradient Boosting
+
+The last model is [gradient boosting](https://xgboost.readthedocs.io/en/stable/R-package/xgboostPresentation.html).
+We choose it since it won many data science competition.
+
+We separate the dataset into training, test, predictors and outcome dataset:
+```{r}
+xgb_train <- df[train_index,] %>% select(-price)
+xgb_test <- df[-train_index,] %>% select(-price)
+
+xgb_y_train <- df[train_index,] %>% select(price)
+xgb_y_test <- df[-train_index,] %>% select(price) %>% pull
+```
+
+We generate the model using with the following hyperparameters. [Details](https://xgboost.readthedocs.io/en/latest/parameter.html#parameters-for-linear-booster-booster-gblinear)
+  - **max_depth** : depth of the tree  
+  - **eta** : learning rate, used to prevent overfitting by making the boosting process more conservative  
+  - **nrounds** : max number of boosting iterations.  
+  - **objective** : learning task
+
+For the project we, will set nrounds to 25 and use a tuning grid for eta and max_depth.
+Eta can take value between 0 and 1. Depth between 1 and Inf.
+```{r tuning grid}
+tuneGridboost <- expand.grid(eta = seq(0,1, 0.01), depth = seq(10,30,5))
+```
+
+We calculate the rmse based on eta and depth value.
+```{r boostmodel}
+gradientModel <- function(etavalue, depthvalue){
+       mod <- xgboost(data = as.matrix(xgb_train), label = as.matrix(xgb_y_train), 
+        max_depth = depthvalue, 
+        eta = etavalue, 
+        nrounds = 25,
+        objective = "reg:squarederror",
+        verbose = FALSE)
+rmse <- RMSE(predict(mod, as.matrix(xgb_test), reshape = TRUE), xgb_y_test)
+return(list(eta = etavalue,depth = depthvalue, rmse = rmse))
+}
+```
+We map the model to the tuning grid and visual which are hyperparameters give the best score
+
+```{r mapboostmodel}
+tuning <- map2(tuneGridboost$eta, tuneGridboost$depth , gradientModel) %>%
+  do.call(rbind, .) %>% as_tibble
+
+tuning[which.min(tuning$rmse),] %>% glimpse
+rmse_boost <- tuning[which.min(tuning$rmse),"rmse"] %>% unlist
+
+```
+
+
+## 4. Modeling Results
+We have the following RMSE for the 4 models that we trained
+
+```{r, echo = FALSE}
+data.frame(rmse_lm, rmse_lm_pca, rmse_rf, rmse_boost = rmse_boost)
+```
+RandomForest and Gradient Boost obtained the best scores.  
+They predict price with an error of around 10 dollars.
+We notice that the pca linear model have a slightly worse score than the linear model since we only used the first principal component.
+
+## 5. Conclusion
+We fetched the web to scrap the companies financial statement data and stock price.
+We join the data together to create a unique dataset and build a model that predict the price based on the financial statements. In addition, we could have add other economic data like [FRED](https://fred.stlouisfed.org/) or other [Government data](https://data.gov/).\
+I choosed this topic for my project because I'm very interested in the stock market and in value investment. Many books that I read mentioned the importance of financial statements analysis and it was therefore a good opportunity to apply the concepts that I've learned in this data science course.
+
+### Notes about the dataset
+
+The dataset has some limitations  
+  - We limit the study to the oil Company to keep the project simple, with a fast computation.  
+  - it doesn't contain much observation ( ~ 230 observations).  
+  - We used the year average for the stock price while big price variation can happen throughout a year  
+  - Missing financial statements. The filled statement aren't consistent throughout the year and across companies. They use different statement label. We use the column mean to fill the missing value. We could have use other method such knn or random Forest for filling it.
+
+### Notes about modeling
+We only used three models and didn't tuned all the hyper parameters. We can be interesting to use method such as black box optimization or nested resampling
+Some packages provide user friendly experience for hypermarkets tuning and benchmarking across models. [MLR3 package](https://slds-lmu.github.io/i2ml/) can be a good start for further studying about these concepts.
+
+## 6. References
+
+<https://xgboost.readthedocs.io/en/latest/index.html>  
+<https://mlr-org.com/>  
+<https://slds-lmu.github.io/i2ml/>  
+<https://www.tidymodels.org/learn/work/nested-resampling/>  
+<https://www.sec.gov/>  
+<https://en.wikipedia.org>  
+<https://www.macrotrends.net>  
+<https://machinelearningmastery.com/machine-learning-checklist/>  
+<https://www.r-bloggers.com/2021/02/machine-learning-with-r-a-complete-guide-to-gradient-boosting-and-xgboost/>  
+<https://www.investopedia.com/>  
+<https://statisticsglobe.com/r-install-missing-packages-automatically>
